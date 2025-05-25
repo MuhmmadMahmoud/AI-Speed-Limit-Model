@@ -5,7 +5,7 @@ import multiprocessing
 workers = 1  # Using 1 worker to minimize memory usage
 worker_class = 'sync'
 worker_connections = 1000
-timeout = 30
+timeout = 120  # Increased timeout for model loading
 keepalive = 2
 
 # Server socket
@@ -25,4 +25,9 @@ pidfile = None
 umask = 0
 user = None
 group = None
-tmp_upload_dir = None 
+tmp_upload_dir = None
+
+# Memory management
+max_requests = 1000
+max_requests_jitter = 50
+worker_tmp_dir = '/dev/shm'  # Use RAM for temporary files 
