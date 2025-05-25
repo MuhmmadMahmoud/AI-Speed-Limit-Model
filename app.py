@@ -5,6 +5,9 @@ from tensorflow.keras.models import load_model
 import os
 import requests
 import datetime
+import time
+import gc
+from functools import lru_cache
 
 app = Flask(__name__)
 
@@ -21,30 +24,90 @@ except FileNotFoundError:
     # If scaler file doesn't exist, proceed without it
     scaler = None
 
-# Function to get road type from coordinates
-def get_road_type(latitude, longitude):
+# Cache for API responses
+road_cache = {}
+weather_cache = {}
+
+@lru_cache(maxsize=100)
+def get_road_data(latitude, longitude):
+    cache_key = f"{latitude:.4f}_{longitude:.4f}"
+    if cache_key in road_cache:
+        if time.time() - road_cache[cache_key]['timestamp'] < 1800:  # 30 min cache
+            return road_cache[cache_key]['data']
+    
     try:
-        # Using OpenStreetMap Nominatim API to get road information
-        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={latitude}&lon={longitude}"
-        response = requests.get(url, headers={'User-Agent': 'SpeedLimitApp/1.0'})
+        # Using Overpass API for better road data
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json];
+        way(around:50,{latitude},{longitude})[highway];
+        out geom;
+        """
+        response = requests.get(overpass_url, params={'data': query})
         data = response.json()
         
-        # Extract road type information
-        if 'road' in data.get('address', {}):
-            road_name = data['address']['road']
-            # Simple classification based on road name
-            if 'highway' in road_name.lower() or 'freeway' in road_name.lower() or 'motorway' in road_name.lower():
-                return 1  # Highway
-            elif 'street' in road_name.lower() or 'avenue' in road_name.lower():
-                return 2  # Urban
+        if not data['elements']:
+            road_type = 0  # Default to residential
+        else:
+            road = data['elements'][0]
+            tags = road.get('tags', {})
+            road_type = tags.get('highway', 'unknown')
+            
+            # Map to our model's road types (0: residential, 1: highway, 2: urban)
+            if road_type in ['motorway', 'trunk', 'primary']:
+                road_type = 1  # Highway
+            elif road_type in ['secondary', 'tertiary']:
+                road_type = 2  # Urban
             else:
-                return 0  # Residential
-        return 0  # Default to residential if no road info
+                road_type = 0  # Residential
+                
+        result = {'road_type': road_type}
+        road_cache[cache_key] = {
+            'data': result,
+            'timestamp': time.time()
+        }
+        return result
     except Exception as e:
-        print(f"Error getting road type: {e}")
-        return 0  # Default to residential on error
+        print(f"Error getting road data: {e}")
+        return {'road_type': 0}  # Default to residential on error
 
-# Function to estimate traffic based on time and location
+@lru_cache(maxsize=100)
+def get_weather_data(latitude, longitude):
+    cache_key = f"{latitude:.4f}_{longitude:.4f}"
+    if cache_key in weather_cache:
+        if time.time() - weather_cache[cache_key]['timestamp'] < 1800:  # 30 min cache
+            return weather_cache[cache_key]['data']
+    
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=temperature_2m,weathercode,precipitation"
+        response = requests.get(url)
+        data = response.json()
+        
+        current = data.get('current', {})
+        weather_code = current.get('weathercode', 0)
+        temperature = current.get('temperature_2m', 20)
+        precipitation = current.get('precipitation', 0)
+        
+        # Classify weather (0: clear, 1: foggy, 2: rainy)
+        if weather_code >= 95 or precipitation > 0.5:  # Thunderstorm or heavy rain
+            weather = 2
+        elif weather_code >= 51 or precipitation > 0.1:  # Light rain
+            weather = 2
+        elif weather_code in [45, 48]:  # Fog
+            weather = 1
+        else:
+            weather = 0  # Clear
+            
+        result = {'weather': weather}
+        weather_cache[cache_key] = {
+            'data': result,
+            'timestamp': time.time()
+        }
+        return result
+    except Exception as e:
+        print(f"Error getting weather: {e}")
+        return {'weather': 0}  # Default to clear weather
+
 def estimate_traffic(latitude, longitude):
     # This is a simplified traffic estimation
     # In a real app, you would use a traffic API
@@ -58,33 +121,6 @@ def estimate_traffic(latitude, longitude):
     else:
         return 0.2  # Low traffic at night/early morning
 
-# Function to get weather conditions
-def get_weather(latitude, longitude):
-    try:
-        # Using Open-Meteo API for weather data
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&current=precipitation,rain,showers,snowfall,weathercode"
-        response = requests.get(url)
-        data = response.json()
-        
-        # Check weather conditions
-        current = data.get('current', {})
-        weather_code = current.get('weathercode', 0)
-        precipitation = current.get('precipitation', 0)
-        
-        # Classify weather (0: clear, 1: foggy, 2: rainy)
-        if weather_code >= 95:  # Thunderstorm
-            return 2
-        elif weather_code >= 51 or precipitation > 0.5:  # Rain or drizzle
-            return 2
-        elif weather_code in [45, 48]:  # Fog
-            return 1
-        else:
-            return 0  # Clear
-    except Exception as e:
-        print(f"Error getting weather: {e}")
-        return 0  # Default to clear weather on error
-
-# Function to check proximity to schools
 def check_school_proximity(latitude, longitude):
     try:
         # Using OpenStreetMap Overpass API to find nearby schools
@@ -108,7 +144,6 @@ def check_school_proximity(latitude, longitude):
         print(f"Error checking school proximity: {e}")
         return 0  # Default to no schools nearby on error
 
-# Function to determine time of day
 def get_time_of_day():
     current_hour = datetime.datetime.now().hour
     
@@ -121,12 +156,62 @@ def get_time_of_day():
     else:
         return 3  # Night
 
-# Function to estimate road curvature
 def estimate_curvature(latitude, longitude):
-    # This is a placeholder for road curvature estimation
-    # In a real app, you would use map data to calculate actual curvature
-    # For now, we'll return a random value between 0.1 and 0.5
-    return 0.3
+    try:
+        # Using Overpass API to get road geometry
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json];
+        way(around:50,{latitude},{longitude})[highway];
+        out geom;
+        """
+        response = requests.get(overpass_url, params={'data': query})
+        data = response.json()
+        
+        if not data['elements']:
+            return 0.3  # Default moderate curvature
+            
+        road = data['elements'][0]
+        geometry = road.get('geometry', [])
+        
+        if len(geometry) < 3:
+            return 0.1  # Straight road
+            
+        # Calculate total angle change
+        total_angle = 0.0
+        for i in range(1, len(geometry) - 1):
+            p1 = geometry[i - 1]
+            p2 = geometry[i]
+            p3 = geometry[i + 1]
+            
+            # Calculate vectors
+            v1 = (p1['lon'] - p2['lon'], p1['lat'] - p2['lat'])
+            v2 = (p3['lon'] - p2['lon'], p3['lat'] - p2['lat'])
+            
+            # Calculate angle
+            dot_prod = v1[0]*v2[0] + v1[1]*v2[1]
+            mag1 = (v1[0]**2 + v1[1]**2)**0.5
+            mag2 = (v2[0]**2 + v2[1]**2)**0.5
+            
+            if mag1 * mag2 == 0:
+                continue
+                
+            cos_angle = dot_prod / (mag1 * mag2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))  # Clamp to valid range
+            angle = abs(np.degrees(np.arccos(cos_angle)))
+            total_angle += angle
+            
+        # Normalize curvature to 0-1 range
+        if total_angle < 10:
+            return 0.1  # Straight
+        elif total_angle < 30:
+            return 0.3  # Moderate curve
+        else:
+            return 0.5  # Sharp curve
+            
+    except Exception as e:
+        print(f"Error calculating curvature: {e}")
+        return 0.3  # Default moderate curvature
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -137,35 +222,41 @@ def predict():
     try:
         # Get data from request
         data = request.get_json()
-        
-        # Extract coordinates and speed
         latitude = data.get('latitude', 0)
         longitude = data.get('longitude', 0)
         actual_speed = data.get('actual_speed', 0)
         
-        # Get road and environmental features from coordinates
-        road_type = get_road_type(latitude, longitude)
+        # Get enhanced road and weather data
+        road_info = get_road_data(latitude, longitude)
+        weather_info = get_weather_data(latitude, longitude)
+        
+        # Get other features
         traffic = estimate_traffic(latitude, longitude)
         curvature = estimate_curvature(latitude, longitude)
-        weather = get_weather(latitude, longitude)
         proximity_to_school = check_school_proximity(latitude, longitude)
         time_of_day = get_time_of_day()
         
-        # Prepare input for model
-        input_data = np.array([[road_type, traffic, curvature, weather, 
-                               proximity_to_school, time_of_day]])
+        # Prepare input for model using all features
+        input_data = np.array([[
+            road_info['road_type'],
+            traffic,
+            curvature,
+            weather_info['weather'],
+            proximity_to_school,
+            time_of_day
+        ]])
         
-        # If you have a scaler, apply it here
+        # Apply scaler if available
         if scaler:
             input_data = scaler.transform(input_data)
         
         # Make prediction
-        predicted_speed_limit = float(model.predict(input_data)[0][0])
+        predicted_speed_limit = float(model.predict(input_data, verbose=0)[0][0])
         
         # Round to nearest 10 for more realistic speed limit
         allowed_speed = round(predicted_speed_limit / 10) * 10
         
-        # Prepare response
+        # Keep the same response format
         response = {
             'allowed_speed': allowed_speed
         }
@@ -181,6 +272,13 @@ def predict():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 400
+
+# Add memory cleanup
+@app.after_request
+def after_request(response):
+    gc.collect()
+    tf.keras.backend.clear_session()
+    return response
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
